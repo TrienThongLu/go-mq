@@ -6,17 +6,15 @@ import (
 )
 
 type ConsumerGroup struct {
-	id             uint16
-	offset         uint32
-	consumers      []*ConsumerConn
-	readyConsumers []*ConsumerConn
-	lock           sync.Mutex
+	id         uint16
+	consumers  []*ConsumerConn
+	partitions []*Partition
+	lock       sync.Mutex
 }
 
 func createConsumerGroup(id uint16) *ConsumerGroup {
 	return &ConsumerGroup{
-		id:     id,
-		offset: 0,
+		id: id,
 	}
 }
 

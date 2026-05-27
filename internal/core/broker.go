@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"math"
 	"net"
-	"time"
 
 	"github.com/TrienThongLu/goMQ/internal/config"
 )
@@ -99,7 +97,6 @@ func (b *Broker) processProducerRegisterMessage(producerRegMsg ProducerRegisterM
 	if topic == nil {
 		topic = createTopic(producerRegMsg.topicID)
 		b.topics = append(b.topics, topic)
-		go b.stopAndPop(topic)
 	}
 
 	go func() {
@@ -121,7 +118,7 @@ func (b *Broker) processProducerRegisterMessage(producerRegMsg ProducerRegisterM
 				}
 
 				err = WriteMessageToStream(streamRW, Message{
-					R_P_C_M: resp,
+					R_P_C_M: &resp,
 				})
 				if err != nil {
 					panic(err)
@@ -136,13 +133,42 @@ func (b *Broker) processProducerRegisterMessage(producerRegMsg ProducerRegisterM
 	return &resp, nil
 }
 
-func (b *Broker) processProducerPCM(pcm []byte, topic *Topic) (*byte, error) {
-	topic.queue.push(pcm)
-	topic.queue.debug(topic.id)
+func (b *Broker) processProducerPCM(pcm []byte, topic *Topic) (byte, error) {
+	if len(topic.consumerGroups) == 0 {
+		topic.queue.push(pcm)
+		topic.queue.debug(topic.id)
+	} else {
+		for _, cGroup := range topic.consumerGroups {
+			minSize := config.QueueSize
+			partitionIdx := -1
+			for idx, partition := range cGroup.partitions {
+				currentSize := partition.queue.size()
+				if currentSize < minSize {
+					minSize = currentSize
+					partitionIdx = idx
+				}
+			}
 
-	var resp byte = 0
+			if partitionIdx != -1 {
+				partition := cGroup.partitions[partitionIdx]
+				partition.lock.Lock()
 
-	return &resp, nil
+				for {
+					msg := topic.queue.pop()
+					if msg == nil {
+						break
+					}
+					partition.queue.push(msg)
+				}
+
+				partition.queue.push(pcm)
+				fmt.Printf("Put data '%s' to cgroup %d, partition %d\n", string(pcm), cGroup.id, partitionIdx)
+				partition.lock.Unlock()
+			}
+		}
+	}
+
+	return 0, nil
 }
 
 func (b *Broker) processConsumerRegisterMessage(consumerRegMsg ConsumerRegisterMessage) (*byte, error) {
@@ -156,7 +182,6 @@ func (b *Broker) processConsumerRegisterMessage(consumerRegMsg ConsumerRegisterM
 	if topic == nil {
 		topic = createTopic(consumerRegMsg.topicID)
 		b.topics = append(b.topics, topic)
-		go b.stopAndPop(topic)
 	}
 
 	var cGroup *ConsumerGroup
@@ -171,124 +196,61 @@ func (b *Broker) processConsumerRegisterMessage(consumerRegMsg ConsumerRegisterM
 		topic.lock.Lock()
 		topic.consumerGroups = append(topic.consumerGroups, cGroup)
 		topic.lock.Unlock()
-		// go b.startConsumerGroupConsumption(topic, cGroup)
 	}
 
 	conn, _ := net.Dial("tcp", fmt.Sprintf(":%d", consumerRegMsg.port))
 	fmt.Printf("Connected to consumer at port %v\n", consumerRegMsg.port)
+
 	consumerConn := createConsumerConn(conn)
 	cGroup.lock.Lock()
 	cGroup.consumers = append(cGroup.consumers, consumerConn)
+
+	if len(cGroup.consumers) > len(cGroup.partitions) {
+		cGroup.partitions = append(cGroup.partitions, CreatePartition())
+	}
+	partition := cGroup.partitions[len(cGroup.partitions)-1]
+
 	cGroup.lock.Unlock()
-	go b.readConsumerReadyAndSend(topic, cGroup, consumerConn)
+	go b.readConsumerReadyAndSend(consumerConn, partition)
 
 	var resp byte = 0
 	return &resp, nil
 }
 
-// Push-based
-func (b *Broker) startConsumerGroupConsumption(topic *Topic, cGroup *ConsumerGroup) {
-	for {
-		cGroup.lock.Lock()
-		offset := cGroup.offset
-		pcm := topic.queue.peek(offset)
-		if pcm == nil {
-			cGroup.lock.Unlock()
-			continue
-		}
-
-		for _, consumer := range cGroup.consumers {
-			if consumer.status {
-				streamRW := bufio.NewReadWriter(bufio.NewReader(consumer.conn), bufio.NewWriter(consumer.conn))
-
-				consumer.status = false
-				err := WriteMessageToStream(streamRW, Message{
-					P_C_M: pcm,
-				})
-				if err != nil {
-					panic(err)
-				}
-
-				parsedMsg, err := ReadMessageFromStream(streamRW)
-				if err != nil {
-					panic(err)
-				}
-
-				if parsedMsg.R_P_C_M != nil {
-					consumer.status = true
-				}
-
-				cGroup.offset += 1
-				break
-			}
-		}
-		cGroup.lock.Unlock()
-	}
-}
-
 // Pull-based
-func (b *Broker) readConsumerReadyAndSend(topic *Topic, cGroup *ConsumerGroup, consumerConn *ConsumerConn) {
+func (b *Broker) readConsumerReadyAndSend(consumerConn *ConsumerConn, partition *Partition) {
 	streamRW := bufio.NewReadWriter(bufio.NewReader(consumerConn.conn), bufio.NewWriter(consumerConn.conn))
 
 	for {
-		parsedMessage, err := ReadMessageFromStream(streamRW)
-		if err != nil {
-			panic(err)
+		if !consumerConn.status {
+			parsedMessage, err := ReadMessageFromStream(streamRW)
+			if err != nil {
+				panic(err)
+			}
+
+			if parsedMessage.R_P_C_M != nil {
+				consumerConn.status = true
+			} else {
+				fmt.Printf("Parsed message not R_PCM: %v", parsedMessage)
+				panic("Why not R_PCM???")
+
+			}
 		}
 
-		if parsedMessage.R_P_C_M == nil {
-			fmt.Printf("Parsed message not R_PCM: %v", parsedMessage)
-			panic("Why not R_PCM???")
+		partition.lock.Lock()
+		pcm := partition.queue.pop()
+		partition.lock.Unlock()
+
+		if pcm == nil {
+			continue
 		}
 
-		cGroup.lock.Lock()
-		offset := cGroup.offset
-		var pcm []byte = nil
-		for pcm == nil {
-			pcm = topic.queue.peek(offset)
-		}
-
-		err = WriteMessageToStream(streamRW, Message{
+		consumerConn.status = false
+		err := WriteMessageToStream(streamRW, Message{
 			P_C_M: pcm,
 		})
 		if err != nil {
 			panic(err)
 		}
-
-		cGroup.offset += 1
-		cGroup.lock.Unlock()
-	}
-}
-
-func (b *Broker) stopAndPop(topic *Topic) {
-	for {
-		time.Sleep(5 * time.Second)
-		topic.lock.Lock()
-
-		var minOffset uint32 = math.MaxUint32
-		for _, cGroup := range topic.consumerGroups {
-			minOffset = min(minOffset, cGroup.offset)
-		}
-
-		if minOffset == math.MaxUint32 {
-			topic.lock.Unlock()
-			continue
-		}
-
-		for _, cGroup := range topic.consumerGroups {
-			cGroup.lock.Lock()
-			cGroup.offset -= minOffset
-		}
-
-		for minOffset > 0 {
-			topic.queue.pop()
-			minOffset--
-		}
-
-		for _, cGroup := range topic.consumerGroups {
-			cGroup.lock.Unlock()
-		}
-
-		topic.lock.Unlock()
 	}
 }
